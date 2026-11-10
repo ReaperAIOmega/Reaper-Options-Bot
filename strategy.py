@@ -76,3 +76,41 @@ def ftfc_direction(candles_by_tf: dict[str, list]) -> str | None:
     if len(candles_by_tf) < 2 or len(directions) != 1:
         return None
     return directions.pop()
+
+
+def ict_fvg_retest(candles, lookback=16):
+    """ICT qualification on intraday bars, using the most recent three-candle fair value gap that formed
+    before the latest bar.
+
+    Bullish gap (c1.high < c3.low): the latest bar trades down into it (low <= c3.low) and closes back above
+    it (close > c3.low). Bearish mirror. A gap is invalidated if any bar between c3 and the latest bar closed
+    through it.
+    """
+    if len(candles) < 4:
+        return None
+    window = candles[-lookback:]
+    last = window[-1]
+    for j in range(len(window) - 4, -1, -1):
+        c1, c3, between = window[j], window[j + 2], window[j + 3:-1]
+        if c1["high"] < c3["low"]:
+            gap_low, gap_high = c1["high"], c3["low"]
+            if any(b["close"] < gap_low for b in between):
+                return None
+            return BULL if last["low"] <= gap_high and last["close"] > gap_high else None
+        if c1["low"] > c3["high"]:
+            gap_low, gap_high = c3["high"], c1["low"]
+            if any(b["close"] > gap_high for b in between):
+                return None
+            return BEAR if last["high"] >= gap_low and last["close"] < gap_low else None
+    return None
+
+
+def orb_direction(opening_bar, latest):
+    """15-minute opening range breakout: the latest completed bar closes outside the 09:30-09:45 range."""
+    if opening_bar is None or latest is None or latest is opening_bar:
+        return None
+    if latest["close"] > opening_bar["high"]:
+        return BULL
+    if latest["close"] < opening_bar["low"]:
+        return BEAR
+    return None

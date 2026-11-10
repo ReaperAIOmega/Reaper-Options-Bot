@@ -66,8 +66,21 @@ def build_rows(bars, today_rows=True, today=date(2026, 3, 11)):
         else:
             rows += sub_bars(day, "13:30", "16:00", o, h, l, c)
     if today_rows:
-        rows += sub_bars(today, "09:30", "10:00", 109.5, 110, 109.4, 109.8)
+        rows += today_bars(today) if today_rows is True else today_rows
     return rows
+
+
+def bar(day, hhmm, o, h, l, c):
+    t = datetime.combine(day, time.fromisoformat(hhmm), ET)
+    return {"time": t.strftime("%Y-%m-%dT%H:%M:%S"), "timestamp": int(t.timestamp()), "open": o, "high": h, "low": l,
+            "close": c, "volume": 1000, "price": c, "vwap": (o + c) / 2}
+
+
+def today_bars(day=date(2026, 3, 11)):
+    """09:30 bar = opening range 109.4-110. 10:00 bar gaps above it (bullish FVG 110-110.8).
+    10:15 bar trades back into the gap (low 110.6) and closes above it (111.0), above the opening range."""
+    return [bar(day, "09:30", 109.5, 110.0, 109.4, 109.8), bar(day, "09:45", 109.8, 110.6, 109.8, 110.5),
+            bar(day, "10:00", 110.8, 111.5, 110.8, 111.4), bar(day, "10:15", 111.4, 111.5, 110.6, 111.0)]
 
 
 DAILY = [{"date": d.isoformat(), "open": o, "high": h, "low": l, "close": c, "volume": 1}
@@ -101,7 +114,7 @@ class FakeClient:
                  expirations=EXPIRATIONS, chain_fn=chain):
         self.rows = build_rows(BULLISH_212) if rows is None else rows
         self.daily, self.weekly, self.clock_state = daily, weekly, clock_state
-        self._quotes = quotes or {"SPY": {"symbol": "SPY", "last": 109.5, "open": 108.0},
+        self._quotes = quotes or {"SPY": {"symbol": "SPY", "last": 111.0, "open": 108.0},
                                   "QQQ": {"symbol": "QQQ", "last": 400.0, "open": 398.0}}
         self.expirations, self.chain_fn, self.calls = expirations, chain_fn, []
 

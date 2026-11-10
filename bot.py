@@ -45,7 +45,9 @@ async def signal_loop(bot: discord.Client):
         print("Refusing to start signal loop: " + "; ".join(problems))
         return
     tradier = TradierClient(config.TRADIER_API_KEY, config.TRADIER_BASE_URL)
-    cfg = EngineConfig(config.WATCHLIST, config.MIN_SCORE, config.MAX_SIGNALS_PER_CYCLE,
+    if config.REJECTED_SYMBOLS:
+        print("Ignoring symbols outside policy:", config.REJECTED_SYMBOLS)
+    cfg = EngineConfig(config.WATCHLIST, config.MAX_SIGNALS_PER_CYCLE,
                        config.MAX_SIGNALS_PER_DAY, config.DATA_DELAY, config.CONTRACT_RULES)
     state = CycleState()
     while not bot.is_closed():

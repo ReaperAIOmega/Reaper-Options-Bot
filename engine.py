@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
 from market_data import ET, sessions_from_calendar
+from policy import effective_watchlist, in_entry_window
 from signals import generate_signal
 
 DISCLAIMER = ("Informational only, not investment advice or a recommendation to buy or sell. "
@@ -26,8 +27,7 @@ class CycleState:
 @dataclass
 class EngineConfig:
     watchlist: list
-    min_score: int = 4
-    max_per_cycle: int = 3
+    max_per_cycle: int = 3   # caps only; the bot never tries to reach a number of ideas
     max_per_day: int = 6
     data_delay: timedelta = timedelta(0)
     contract_rules: dict = field(default_factory=dict)
@@ -56,14 +56,17 @@ def load_sessions(client, now: datetime) -> dict:
 def run_cycle(client, cfg: EngineConfig, state: CycleState, now: datetime) -> dict:
     """Returns {'messages': [...], 'skipped': {symbol: reasons}, 'market': state}."""
     local = now.astimezone(ET)
+    if not in_entry_window(local.time()):
+        return {"messages": [], "skipped": {}, "market": "outside_entry_window"}
     clock = client.clock()
     if clock.get("state") != "open":
         return {"messages": [], "skipped": {}, "market": clock.get("state", "unknown")}
+    watchlist, rejected = effective_watchlist(cfg.watchlist)
     if state.day != local.date():
         state.day, state.sent_today, state.bias_warned = local.date(), 0, False
-        state.sent_keys = {k for k in state.sent_keys if k.split("|")[2][:10] == local.date().isoformat()}
+        state.sent_keys = {k for k in state.sent_keys if k.split("|")[2] == local.date().isoformat()}
 
-    messages, skipped = [], {}
+    messages, skipped = [], {s: ["symbol_not_in_policy"] for s in rejected}
     bias = index_bias(client)
     if bias == "bearish" and not state.bias_warned:
         messages.append("Market check: SPY and QQQ are both below today's open. Signals may be less reliable.")
@@ -71,8 +74,8 @@ def run_cycle(client, cfg: EngineConfig, state: CycleState, now: datetime) -> di
 
     sessions = load_sessions(client, local)
     candidates = []
-    for symbol in cfg.watchlist:
-        signal, reasons = generate_signal(symbol, client, sessions, local, min_score=cfg.min_score,
+    for symbol in watchlist:
+        signal, reasons = generate_signal(symbol, client, sessions, local,
                                           data_delay=cfg.data_delay, contract_rules=cfg.contract_rules)
         if signal is None:
             skipped[symbol] = reasons
@@ -81,7 +84,7 @@ def run_cycle(client, cfg: EngineConfig, state: CycleState, now: datetime) -> di
         else:
             candidates.append(signal)
 
-    candidates.sort(key=lambda s: (-s["score"], s["symbol"]))
+    candidates.sort(key=lambda s: s["symbol"])
     room = max(0, min(cfg.max_per_cycle, cfg.max_per_day - state.sent_today))
     for signal in candidates[:room]:
         messages.append(format_signal(signal))
@@ -93,12 +96,12 @@ def run_cycle(client, cfg: EngineConfig, state: CycleState, now: datetime) -> di
 
 
 def format_signal(s: dict) -> str:
-    c = s["contract"]
+    c, orb = s["contract"], s["opening_range"]
     return (
-        f"**[{s['symbol']}] {s['direction']} idea | score {s['score']}**\n"
-        f"Underlying: {s['underlying']} | Setups: {', '.join(s['setups'])} ({s['trend']} continuity)\n"
-        f"Listed contract: {c['option_symbol']} | {c['strike']} {c['option_type']} exp {c['expiration']} "
-        f"({c['dte']} DTE) | bid {c['bid']} / ask {c['ask']} | OI {c['open_interest']}\n"
-        f"Setup bar closed: {s['setup_bar_end']}\n"
+        f"**[{s['symbol']}] {s['direction']} idea** | ICT + Strat ({', '.join(s['strat_setups'])}) + 15m ORB, {s['trend']}\n"
+        f"Underlying: {s['underlying']} | Opening range {orb['low']}-{orb['high']}\n"
+        f"Listed contract: {c['option_symbol']} | {c['strike']} {c['option_type']} exp {c['expiration']} ({c['dte']} DTE)\n"
+        f"Size: {c['contracts']} contract | bid {c['bid']} / ask {c['ask']} | max premium ${c['max_premium_usd']:.2f} | OI {c['open_interest']}\n"
+        f"Signal bar closed: {s['signal_bar_end']}\n"
         f"_{DISCLAIMER}_"
     )

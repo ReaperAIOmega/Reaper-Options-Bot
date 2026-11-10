@@ -1,62 +1,95 @@
 from datetime import datetime, timedelta
 
-from engine import CycleState, EngineConfig, run_cycle
+from engine import CycleState, EngineConfig, load_sessions, run_cycle
 from market_data import ET
 from signals import generate_signal
-from engine import load_sessions
-from tests.fixtures import BULLISH_212, DAILY, FakeClient, build_rows
+from tests.fixtures import BULLISH_212, DAILY, FakeClient, bar, build_rows, today_bars
 
-NOW = datetime(2026, 3, 11, 10, 0, tzinfo=ET)
+NOW = datetime(2026, 3, 11, 10, 30, tzinfo=ET)
 
 
 def cfg(**kw):
     return EngineConfig(watchlist=["SPY"], **kw)
 
 
-def test_end_to_end_bullish_212_produces_listed_call_once():
+def sig(client, now=NOW):
+    return generate_signal("SPY", client, load_sessions(client, now), now)
+
+
+def test_all_three_qualifications_produce_one_policy_contract_once():
     client, state = FakeClient(), CycleState()
     first = run_cycle(client, cfg(), state, NOW)
     assert len(first["messages"]) == 1, first["skipped"]
     msg = first["messages"][0]
-    assert "[SPY] Call idea" in msg and "110 call exp 2026-03-20" in msg and "No orders are placed" in msg
-    assert "@everyone" not in msg
+    assert "[SPY] Call idea" in msg and "ICT + Strat (2-1-2) + 15m ORB" in msg
+    assert "115 call exp 2026-03-13 (2 DTE)" in msg and "Size: 1 contract" in msg and "max premium $110.00" in msg
+    assert "No orders are placed" in msg and "@everyone" not in msg
     second = run_cycle(client, cfg(), state, NOW + timedelta(minutes=15))
-    assert second["messages"] == []
-    assert second["skipped"]["SPY"] == ["duplicate_of_already_sent_signal"]
+    assert second["messages"] == [] and second["skipped"]["SPY"] == ["duplicate_of_already_sent_signal"]
 
 
 def test_signal_fields_are_deterministic():
-    client = FakeClient()
-    sig, reasons = generate_signal("SPY", client, load_sessions(client, NOW), NOW)
+    s, reasons = sig(FakeClient())
     assert reasons == ["signal"]
-    assert sig["trend"] == "bullish" and sig["direction"] == "Call" and sig["setups"] == ["2-1-2"] and sig["score"] == 4
-    assert sig["setup_bar_end"] == "2026-03-10T16:00:00-04:00"
-    assert sig["dedupe_key"] == "SPY|bullish|2026-03-10T16:00:00-04:00|SPY260320C00110000"
+    assert s["trend"] == "bullish" and s["qualifications"] == ["ict", "orb15", "strat"] and s["strat_setups"] == ["2-1-2"]
+    assert s["opening_range"] == {"high": 110.0, "low": 109.4}
+    assert s["contract"]["max_premium_usd"] == 110.0 and s["contract"]["contracts"] == 1
+    assert s["dedupe_key"] == "SPY|bullish|2026-03-11"
 
 
-def test_closed_market_does_nothing_and_fetches_nothing_else():
-    client = FakeClient(clock_state="closed")
-    out = run_cycle(client, cfg(), CycleState(), NOW)
-    assert out == {"messages": [], "skipped": {}, "market": "closed"} and client.calls == ["clock"]
+def test_entry_window_is_enforced_before_any_market_data_call():
+    for t in [(9, 44), (15, 0), (15, 30), (9, 30)]:
+        client = FakeClient()
+        out = run_cycle(client, cfg(), CycleState(), NOW.replace(hour=t[0], minute=t[1]))
+        assert out == {"messages": [], "skipped": {}, "market": "outside_entry_window"} and client.calls == []
+    assert sig(FakeClient(), NOW.replace(hour=14, minute=59))[1] != ["outside_entry_window"]
+
+
+def test_symbols_outside_policy_are_refused():
+    out = run_cycle(FakeClient(), EngineConfig(watchlist=["SPY", "TSLA"]), CycleState(), NOW)
+    assert out["skipped"]["TSLA"] == ["symbol_not_in_policy"] and len(out["messages"]) == 1
+    assert generate_signal("AAPL", FakeClient(), {}, NOW) == (None, ["symbol_not_in_policy"])
+
+
+def test_missing_ict_or_orb_blocks_the_signal():
+    no_gap = today_bars()[:2] + [bar(NOW.date(), "10:00", 110.5, 111.2, 110.4, 111.1), bar(NOW.date(), "10:15", 111.1, 111.3, 110.9, 111.2)]
+    s, reasons = sig(FakeClient(rows=build_rows(BULLISH_212, today_rows=no_gap)))
+    assert s is None and reasons == ["missing_qualification:ict"]
+    inside_range = today_bars()[:3] + [bar(NOW.date(), "10:15", 111.4, 111.5, 109.5, 109.9)]
+    s, reasons = sig(FakeClient(rows=build_rows(BULLISH_212, today_rows=inside_range)))
+    assert s is None and "orb15" in reasons[0]
+
+
+def test_strat_bullish_but_ict_and_orb_bearish_is_refused():
+    d = NOW.date()
+    bearish_today = [bar(d, "09:30", 109.5, 110.0, 109.4, 109.8), bar(d, "09:45", 109.8, 109.8, 109.1, 109.2),
+                     bar(d, "10:00", 108.6, 108.6, 108.0, 108.1), bar(d, "10:15", 108.1, 108.8, 108.0, 108.3)]
+    s, reasons = sig(FakeClient(rows=build_rows(BULLISH_212, today_rows=bearish_today)))
+    assert s is None and reasons == ["qualifications_disagree:ict=bearish,orb15=bearish,strat=bullish"]
+
+
+def test_missing_strat_continuity_blocks_the_signal():
+    bearish_daily = DAILY[:-2] + [{**DAILY[-2], "open": 110, "close": 101}] + DAILY[-1:]
+    s, reasons = sig(FakeClient(daily=bearish_daily))
+    assert s is None and reasons[0] == "missing_qualification:strat" and "no_full_timeframe_continuity" in reasons
 
 
 def test_stale_intraday_data_is_rejected():
-    client = FakeClient(rows=build_rows(BULLISH_212, today_rows=False))
-    sig, reasons = generate_signal("SPY", client, load_sessions(client, NOW), NOW)
-    assert sig is None and reasons == ["stale_or_missing_intraday_data"]
+    s, reasons = sig(FakeClient(rows=build_rows(BULLISH_212, today_rows=False)))
+    assert s is None and reasons == ["stale_or_missing_intraday_data"]
 
 
-def test_conflicting_continuity_suppresses_signal():
-    bearish_daily = DAILY[:-2] + [{**DAILY[-2], "open": 110, "close": 101}] + DAILY[-1:]
-    client = FakeClient(daily=bearish_daily)
-    sig, reasons = generate_signal("SPY", client, load_sessions(client, NOW), NOW)
-    assert sig is None and reasons == ["no_full_timeframe_continuity"]
+def test_no_contract_within_premium_cap_or_dte_means_no_signal():
+    from tests.fixtures import chain
+    pricey = lambda e: [{**o, "bid": 3.0, "ask": 3.1} for o in chain(e)]
+    assert sig(FakeClient(chain_fn=pricey)) == (None, ["no_listed_contract_within_policy"])
+    assert sig(FakeClient(expirations=["2026-03-11", "2026-03-20"])) == (None, ["no_listed_contract_within_policy"])
 
 
-def test_no_liquid_listed_contract_means_no_signal():
-    client = FakeClient(chain_fn=lambda e: [])
-    out = run_cycle(client, cfg(), CycleState(), NOW)
-    assert out["messages"] == [] and out["skipped"]["SPY"] == ["no_listed_contract_meets_liquidity_rules"]
+def test_no_quota_nothing_qualifies_means_nothing_sent():
+    client = FakeClient(rows=build_rows(BULLISH_212, today_rows=today_bars()[:2]))
+    out = run_cycle(client, cfg(), CycleState(), NOW.replace(hour=10, minute=0))
+    assert out["messages"] == [] and out["skipped"]["SPY"]
 
 
 def test_daily_cap_is_enforced():
@@ -66,7 +99,7 @@ def test_daily_cap_is_enforced():
 
 
 def test_bearish_bias_note_once_per_day_without_mentions():
-    quotes = {"SPY": {"symbol": "SPY", "last": 109.5, "open": 111.0}, "QQQ": {"symbol": "QQQ", "last": 1, "open": 2}}
+    quotes = {"SPY": {"symbol": "SPY", "last": 111.0, "open": 112.0}, "QQQ": {"symbol": "QQQ", "last": 1, "open": 2}}
     state = CycleState()
     first = run_cycle(FakeClient(quotes=quotes), cfg(), state, NOW)
     second = run_cycle(FakeClient(quotes=quotes), cfg(), state, NOW + timedelta(minutes=15))
@@ -76,11 +109,15 @@ def test_bearish_bias_note_once_per_day_without_mentions():
 
 def test_discord_layer_imports_and_never_pings_by_default(monkeypatch):
     import importlib, sys
-    for k, v in {"DISCORD_BOT_TOKEN": "x", "TRADIER_API_KEY": "x", "SIGNALS_CHANNEL_ID": "1", "WATCHLIST": "spy"}.items():
+    for k, v in {"DISCORD_BOT_TOKEN": "x", "TRADIER_API_KEY": "x", "SIGNALS_CHANNEL_ID": "1", "WATCHLIST": "spy,tsla",
+                 "MAX_DTE": "30", "MAX_PREMIUM_USD": "500"}.items():
         monkeypatch.setenv(k, v)
     monkeypatch.delenv("MENTION_EVERYONE", raising=False)
     for m in ("config", "bot"):
         sys.modules.pop(m, None)
+    config = importlib.import_module("config")
+    assert config.WATCHLIST == ["SPY"] and config.REJECTED_SYMBOLS == ["TSLA"]
+    assert config.CONTRACT_RULES["max_dte"] == 7 and config.CONTRACT_RULES["max_premium_usd"] == 200.0, "env cannot loosen policy"
     bot = importlib.import_module("bot")
     assert bot.ALLOWED_MENTIONS.everyone is False and bot.ALLOWED_MENTIONS.roles is False
     assert bot.check_channel_permissions(None) == ["signals channel not found or not visible to the bot"]

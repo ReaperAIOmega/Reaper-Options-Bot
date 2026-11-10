@@ -1,91 +1,88 @@
-from tradier_api import get_candles, get_quote
-from strategy import *
-from market import get_index_bias
-from datetime import datetime, time
-import random
+"""Build at most one informational signal per symbol from completed bars and a listed contract.
 
-def calculate_strike(price, direction="call"):
-    # Round strike to nearest 5 for calls, 5 down for puts
-    step = 5
-    if direction == "call":
-        return round(price / step) * step + step
-    else:
-        return round(price / step) * step - step
+Returns (signal | None, reasons). `reasons` explains every rejection so a run can be audited.
+"""
 
-def score_signal(setup_names):
-    # Basic scoring: +1 per valid setup detected
-    score = 0
-    scoring_details = []
-    if "2-1-2_bullish" in setup_names:
-        score += 2
-        scoring_details.append("2-1-2 bullish")
-    if "2-1-2_bearish" in setup_names:
-        score += 2
-        scoring_details.append("2-1-2 bearish")
-    if "fvg_filled" in setup_names:
-        score += 2
-        scoring_details.append("FVG filled")
-    if "failed_2u" in setup_names:
-        score += 1
-        scoring_details.append("Failed 2U")
-    if "ftfc" in setup_names:
-        score += 2
-        scoring_details.append("FTFC alignment")
-    return score, scoring_details
+from __future__ import annotations
 
-def generate_signals_for_symbol(symbol):
-    signals = []
-    candles_by_tf = {}
-    for tf in ["120", "240", "D", "W"]:
-        candles = get_candles(symbol, tf)
-        if not candles:
-            continue
-        candles_by_tf[tf] = candles
+from datetime import datetime, timedelta
 
-    # Check multi-timeframe FTFC
-    if not ftfc_alignment(candles_by_tf):
-        return []
+from contracts import select_contract
+from market_data import ET, aggregate_intraday, completed_history, is_fresh
+from strategy import BEAR, BULL, failed_2u, fvg_retest, ftfc_direction, two_one_two
 
-    setups_found = []
-    # Check setups on 4h timeframe for example
-    fourh_candles = candles_by_tf.get("240", [])
-    if len(fourh_candles) >= 3:
-        if is_2_1_2_bullish(fourh_candles[-3:]):
-            setups_found.append("2-1-2_bullish")
-        if is_2_1_2_bearish(fourh_candles[-3:]):
-            setups_found.append("2-1-2_bearish")
-        if failed_2u(fourh_candles[-3:]):
-            setups_found.append("failed_2u")
+WEIGHTS = {"2-1-2": 2, "fvg_retest": 2, "failed_2u": 1, "ftfc": 2}
 
-    # Check FVG fill on daily
-    daily_candles = candles_by_tf.get("D", [])
-    if len(daily_candles) >= 3 and is_fvg_filled(daily_candles[-3], daily_candles[-2], daily_candles[-1]):
-        setups_found.append("fvg_filled")
 
-    if not setups_found:
-        return []
+def generate_signal(symbol: str, client, sessions: dict, now: datetime, *, min_score: int = 4,
+                    data_delay: timedelta = timedelta(0), contract_rules: dict | None = None):
+    reasons: list[str] = []
+    now = now.astimezone(ET)
+    start = (now - timedelta(days=30)).strftime("%Y-%m-%d 09:30")
+    rows = client.timesales(symbol, "15min", start, now.strftime("%Y-%m-%d %H:%M"))
+    base = aggregate_intraday(rows, 15, sessions, now, data_delay)
+    if not is_fresh(base, 15, now, data_delay):
+        return None, ["stale_or_missing_intraday_data"]
 
-    score, details = score_signal(setups_found)
-    if score < 2:
-        return []
+    daily = completed_history(client.history(symbol, "daily", (now - timedelta(days=180)).date().isoformat(),
+                                             now.date().isoformat()), "daily", now, sessions)
+    weekly = completed_history(client.history(symbol, "weekly", (now - timedelta(days=730)).date().isoformat(),
+                                              now.date().isoformat()), "weekly", now, sessions)
+    bars = {
+        "120": aggregate_intraday(rows, 120, sessions, now, data_delay),
+        "240": aggregate_intraday(rows, 240, sessions, now, data_delay),
+        "D": daily,
+        "W": weekly,
+    }
+    if any(len(v) < 4 for v in bars.values()):
+        return None, ["insufficient_completed_bars:" + ",".join(k for k, v in bars.items() if len(v) < 4)]
 
-    quote = get_quote(symbol)
-    price = quote["last"]
+    trend = ftfc_direction(bars)
+    if trend is None:
+        return None, ["no_full_timeframe_continuity"]
 
-    direction = "Call" if "2-1-2_bullish" in setups_found else "Put"
+    found = {}
+    if (d := two_one_two(bars["240"])) is not None:
+        found["2-1-2"] = d
+    if (d := failed_2u(bars["240"])) is not None:
+        found["failed_2u"] = d
+    if (d := fvg_retest(bars["D"])) is not None:
+        found["fvg_retest"] = d
+    if not found:
+        return None, ["no_setup"]
+    if any(d != trend for d in found.values()):
+        return None, ["setup_conflicts_with_continuity:" + ",".join(f"{k}={v}" for k, v in found.items())]
 
-    strike = calculate_strike(price, "call" if direction == "Call" else "put")
+    score = WEIGHTS["ftfc"] + sum(WEIGHTS[k] for k in found)
+    if score < min_score:
+        return None, [f"score_below_minimum:{score}<{min_score}"]
 
+    quote = client.quotes([symbol]).get(symbol) or {}
+    price = quote.get("last")
+    if not price:
+        return None, ["no_underlying_quote"]
+
+    contract = select_contract(trend, price, now.date(), client.option_expirations(symbol),
+                               lambda e: client.option_chain(symbol, e), **(contract_rules or {}))
+    if contract is None:
+        return None, ["no_listed_contract_meets_liquidity_rules"]
+
+    setup_bar = bars["240"][-1]["end"]
     signal = {
         "symbol": symbol,
-        "entry": round(price, 2),
-        "strike": f"{strike}{direction[0]}",
-        "expiry": "Weekly",
-        "direction": direction,
+        "direction": "Call" if trend == BULL else "Put",
+        "trend": trend,
         "score": score,
-        "setups": details,
-        "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "reason": ", ".join(details)
+        "setups": sorted(found),
+        "underlying": round(price, 2),
+        "contract": contract,
+        "setup_bar_end": setup_bar.isoformat(),
+        "generated_at": now.isoformat(),
+        # Deduplicate on what the signal is about, not when it was computed.
+        "dedupe_key": f"{symbol}|{trend}|{setup_bar.isoformat()}|{contract['option_symbol']}",
     }
-    signals.append(signal)
-    return signals
+    reasons.append("signal")
+    return signal, reasons
+
+
+__all__ = ["generate_signal", "BULL", "BEAR"]

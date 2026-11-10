@@ -1,0 +1,22 @@
+name: Options Bot Tests
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+      - name: Deterministic fixture tests (no network, no credentials)
+        run: python -m pytest -q
+      - name: No order, account or write endpoints in application code
+        run: |
+          ! grep -rnE "/orders|/accounts|\.post\(|\.put\(|\.delete\(" --include=*.py . --exclude-dir=tests --exclude-dir=.venv

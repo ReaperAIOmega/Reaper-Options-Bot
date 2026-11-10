@@ -1,100 +1,71 @@
-import discord
+"""Discord delivery for informational, read-only option signal ideas. No order execution."""
+
 import asyncio
-from datetime import datetime, time, timedelta
-import pytz
-from config import DISCORD_BOT_TOKEN, SIGNALS_CHANNEL_ID, WATCHLIST, KILLZONES, MAX_SIGNALS
-from signals import generate_signals_for_symbol
-from market import get_index_bias
+from datetime import datetime
 
-intents = discord.Intents.default()
-intents.message_content = True
-client = discord.Client(intents=intents)
+import discord
 
-EST = pytz.timezone("US/Eastern")
+import config
+from engine import CycleState, EngineConfig, run_cycle
+from market_data import ET
+from tradier_api import TradierClient
 
-async def send_signals(channel, signals):
-    if not signals:
+ALLOWED_MENTIONS = discord.AllowedMentions(everyone=config.MENTION_EVERYONE, roles=False, users=False, replied_user=False)
+
+
+class SignalClient(discord.Client):
+    async def setup_hook(self):
+        self.loop.create_task(signal_loop(self))
+
+
+client = SignalClient(intents=discord.Intents.default())
+
+
+def check_channel_permissions(channel) -> list[str]:
+    """Least privilege: the bot needs only View Channel + Send Messages in the signals channel."""
+    if channel is None:
+        return ["signals channel not found or not visible to the bot"]
+    problems = []
+    me = getattr(channel.guild, "me", None)
+    perms = channel.permissions_for(me) if me else None
+    if perms is None or not (perms.view_channel and perms.send_messages):
+        problems.append("bot lacks View Channel / Send Messages in the signals channel")
+    if perms is not None and (perms.administrator or perms.manage_guild or perms.manage_channels):
+        print("WARNING: bot role is over-privileged (administrator/manage); reduce it to view + send.")
+    if config.MENTION_EVERYONE and perms is not None and not perms.mention_everyone:
+        problems.append("MENTION_EVERYONE=true but the bot lacks Mention Everyone permission")
+    return problems
+
+
+async def signal_loop(bot: discord.Client):
+    await bot.wait_until_ready()
+    channel = bot.get_channel(config.SIGNALS_CHANNEL_ID)
+    problems = check_channel_permissions(channel)
+    if problems:
+        print("Refusing to start signal loop: " + "; ".join(problems))
         return
-    msg = ""
-    for sig in signals:
-        msg += (
-            f"**[{sig['symbol']}] {sig['direction']} Signal | Score: {sig['score']}**\n"
-            f"Entry: {sig['entry']}\n"
-            f"Strike: {sig['strike']} ({sig['expiry']})\n"
-            f"Setups: {', '.join(sig['setups'])}\n"
-            f"Time: {sig['time']}\n"
-            f"Reason: {sig['reason']}\n\n"
-        )
-    await channel.send(msg)
+    tradier = TradierClient(config.TRADIER_API_KEY, config.TRADIER_BASE_URL)
+    if config.REJECTED_SYMBOLS:
+        print("Ignoring symbols outside policy:", config.REJECTED_SYMBOLS)
+    cfg = EngineConfig(config.WATCHLIST, config.MAX_SIGNALS_PER_CYCLE,
+                       config.MAX_SIGNALS_PER_DAY, config.DATA_DELAY, config.CONTRACT_RULES)
+    state = CycleState()
+    while not bot.is_closed():
+        try:
+            result = await asyncio.to_thread(run_cycle, tradier, cfg, state, datetime.now(ET))
+            for message in result["messages"]:
+                await channel.send(message, allowed_mentions=ALLOWED_MENTIONS)
+            if result["skipped"]:
+                print("Skipped:", result["skipped"])
+        except Exception as exc:  # keep the loop alive on API/network errors
+            print(f"Signal cycle failed: {exc!r}")
+        await asyncio.sleep(config.CYCLE_SECONDS)
 
-def is_in_killzone(now):
-    # now is aware datetime in EST
-    # Check if current time is within any killzone window +/- 15min
-    killzone_ranges = [
-        (time(9, 0), time(9, 15)),
-        (time(9, 30), time(9, 45)),
-        (time(10, 0), time(10, 15)),
-        (time(13, 30), time(13, 45)),  # NY Killzone open
-        (time(15, 45), time(16, 0)),   # NY Killzone close (4pm EST)
-        (time(15, 30), time(15, 45)),
-    ]
-    for start, end in killzone_ranges:
-        if start <= now.time() <= end:
-            return True
-    return False
-
-async def check_and_send_signals():
-    await client.wait_until_ready()
-    channel = client.get_channel(SIGNALS_CHANNEL_ID)
-
-    sent_alerts = {
-        "first_alert": False,
-        "signals_sent": 0,
-    }
-
-    while not client.is_closed():
-        now = datetime.now(EST)
-        bias = get_index_bias()
-        if bias == "bearish":
-            # Send caution message once per day only
-            if not sent_alerts.get("bias_warned", False):
-                await channel.send(
-                    "@everyone ⚠️ Market shows bearish bias. Trade signals may be less reliable."
-                )
-                sent_alerts["bias_warned"] = True
-        else:
-            sent_alerts["bias_warned"] = False
-
-        max_signals = MAX_SIGNALS["subsequent_alerts"]
-        if not sent_alerts["first_alert"]:
-            # At 9 AM EST max 6 signals
-            if now.time().hour == 9 and now.time().minute <= 15:
-                max_signals = MAX_SIGNALS["first_alert"]
-
-        signals_all = []
-        for symbol in WATCHLIST:
-            signals = generate_signals_for_symbol(symbol)
-            if signals:
-                signals_all.extend(signals)
-
-        # Sort by score descending
-        signals_all.sort(key=lambda s: s["score"], reverse=True)
-
-        # Filter max signals
-        to_send = signals_all[:max_signals]
-
-        if to_send:
-            await send_signals(channel, to_send)
-            sent_alerts["first_alert"] = True
-            sent_alerts["signals_sent"] += len(to_send)
-
-        # Sleep until next target time (roughly every 15-30 min during market hours)
-        await asyncio.sleep(900)
 
 @client.event
 async def on_ready():
     print(f"Logged in as {client.user}")
 
-client.loop.create_task(check_and_send_signals())
 
-client.run(DISCORD_BOT_TOKEN)
+if __name__ == "__main__":
+    client.run(config.DISCORD_BOT_TOKEN)

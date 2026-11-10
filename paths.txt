@@ -1,3 +1,0 @@
-.env
-bot.py
-config.py

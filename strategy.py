@@ -1,76 +1,116 @@
-from datetime import datetime
+"""Price-pattern detectors. Every detector returns a direction or None; none of them guesses.
 
-def is_inside_bar(c1, c2):
-    # c2 is inside bar if high < c1.high and low > c1.low
-    return c2["high"] < c1["high"] and c2["low"] > c1["low"]
+Candles are dicts with open/high/low/close, oldest first.
+"""
 
-def is_outside_bar(c1, c2, c3):
-    # c2 engulfs c1 and c3: high > max(c1.high, c3.high) and low < min(c1.low, c3.low)
-    high_range = max(c1["high"], c3["high"])
-    low_range = min(c1["low"], c3["low"])
-    return c2["high"] > high_range and c2["low"] < low_range
+from __future__ import annotations
 
-def is_2_1_2_bullish(candles):
-    # Bullish continuation 2-1-2 pattern: c1 down, c2 inside, c3 breakout up
-    if len(candles) < 3:
-        return False
-    c1, c2, c3 = candles[-3], candles[-2], candles[-1]
-    return (
-        c1["close"] < c1["open"] and
-        is_inside_bar(c1, c2) and
-        c3["close"] > c2["high"]
-    )
+BULL, BEAR = "bullish", "bearish"
 
-def is_2_1_2_bearish(candles):
-    if len(candles) < 3:
-        return False
-    c1, c2, c3 = candles[-3], candles[-2], candles[-1]
-    return (
-        c1["close"] > c1["open"] and
-        is_inside_bar(c1, c2) and
-        c3["close"] < c2["low"]
-    )
 
-def is_fvg(c1, c2):
-    # Fair Value Gap basic check (gap between c1.low > c2.high)
-    return c1["low"] > c2["high"]
+def _up(c):
+    return c["close"] > c["open"]
 
-def is_fvg_filled(c1, c2, c3):
-    # Check if FVG gap is filled by c3
-    return is_fvg(c1, c2) and c3["low"] <= c2["high"]
 
-def failed_2u(candles):
-    # Failed 2 Up pattern (bearish reversal after 2 up bars)
-    if len(candles) < 3:
-        return False
-    c1, c2, c3 = candles[-3], candles[-2], candles[-1]
-    two_up = c1["close"] > c1["open"] and c2["close"] > c2["open"]
-    failed = c3["close"] < c2["close"] and c3["open"] > c2["close"]
-    return two_up and failed
+def _down(c):
+    return c["close"] < c["open"]
 
-def ftfc_alignment(candles_multi):
-    # candles_multi = dict with timeframe keys: list of candles
-    # Check trend direction consistency across timeframes (close > open = bullish)
-    directions = []
-    for timeframe, candles in candles_multi.items():
-        if len(candles) < 1:
-            continue
-        last_candle = candles[-1]
-        directions.append(1 if last_candle["close"] > last_candle["open"] else -1)
-    if len(directions) < 2:
-        return False
-    return all(d == directions[0] for d in directions)
 
-def get_market_structure_shift(candles):
-    # Simplified: detect break of structure (BOS) or change of character (CHoCH)
-    # For demo, check if last candle close breaks previous high or low
+def is_inside_bar(prev, cur):
+    return cur["high"] < prev["high"] and cur["low"] > prev["low"]
+
+
+def two_one_two(candles):
+    """2-1-2 reversal: directional bar, inside bar, breakout of the inside bar the other way."""
     if len(candles) < 3:
         return None
-    prev_high = max(c["high"] for c in candles[:-1])
-    prev_low = min(c["low"] for c in candles[:-1])
-    last = candles[-1]
-    if last["close"] > prev_high:
-        return "BOS_up"
-    if last["close"] < prev_low:
-        return "BOS_down"
+    c1, c2, c3 = candles[-3:]
+    if not is_inside_bar(c1, c2):
+        return None
+    if _down(c1) and c3["close"] > c2["high"]:
+        return BULL
+    if _up(c1) and c3["close"] < c2["low"]:
+        return BEAR
+    return None
+
+
+def failed_2u(candles):
+    """Two up bars, then a bar that opens above and closes below the prior close: bearish."""
+    if len(candles) < 3:
+        return None
+    c1, c2, c3 = candles[-3:]
+    if _up(c1) and _up(c2) and c3["open"] > c2["close"] and c3["close"] < c2["close"]:
+        return BEAR
+    return None
+
+
+def fvg_retest(candles):
+    """Three-candle fair value gap (c1..c3) retested and respected by the latest bar.
+
+    Bullish gap: c1.high < c3.low; the latest bar trades into the gap but closes above c1.high.
+    Bearish gap: c1.low > c3.high; the latest bar trades into the gap but closes below c1.low.
+    """
+    if len(candles) < 4:
+        return None
+    c1, _, c3, last = candles[-4:]
+    if c1["high"] < c3["low"] and last["low"] <= c3["low"] and last["close"] > c1["high"]:
+        return BULL
+    if c1["low"] > c3["high"] and last["high"] >= c3["high"] and last["close"] < c1["low"]:
+        return BEAR
+    return None
+
+
+def ftfc_direction(candles_by_tf: dict[str, list]) -> str | None:
+    """Full timeframe continuity: the latest completed bar on every timeframe points the same way."""
+    directions = set()
+    for candles in candles_by_tf.values():
+        if not candles:
+            return None
+        last = candles[-1]
+        if _up(last):
+            directions.add(BULL)
+        elif _down(last):
+            directions.add(BEAR)
+        else:
+            return None
+    if len(candles_by_tf) < 2 or len(directions) != 1:
+        return None
+    return directions.pop()
+
+
+def ict_fvg_retest(candles, lookback=16):
+    """ICT qualification on intraday bars, using the most recent three-candle fair value gap that formed
+    before the latest bar.
+
+    Bullish gap (c1.high < c3.low): the latest bar trades down into it (low <= c3.low) and closes back above
+    it (close > c3.low). Bearish mirror. A gap is invalidated if any bar between c3 and the latest bar closed
+    through it.
+    """
+    if len(candles) < 4:
+        return None
+    window = candles[-lookback:]
+    last = window[-1]
+    for j in range(len(window) - 4, -1, -1):
+        c1, c3, between = window[j], window[j + 2], window[j + 3:-1]
+        if c1["high"] < c3["low"]:
+            gap_low, gap_high = c1["high"], c3["low"]
+            if any(b["close"] < gap_low for b in between):
+                return None
+            return BULL if last["low"] <= gap_high and last["close"] > gap_high else None
+        if c1["low"] > c3["high"]:
+            gap_low, gap_high = c3["high"], c1["low"]
+            if any(b["close"] > gap_high for b in between):
+                return None
+            return BEAR if last["high"] >= gap_low and last["close"] < gap_low else None
+    return None
+
+
+def orb_direction(opening_bar, latest):
+    """15-minute opening range breakout: the latest completed bar closes outside the 09:30-09:45 range."""
+    if opening_bar is None or latest is None or latest is opening_bar:
+        return None
+    if latest["close"] > opening_bar["high"]:
+        return BULL
+    if latest["close"] < opening_bar["low"]:
+        return BEAR
     return None

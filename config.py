@@ -3,14 +3,22 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-TRADIER_API_KEY = os.getenv("TRADIER_API_KEY")
+
+def _require(name):
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(f"Missing required environment variable: {name} (see .env.example)")
+    return value
+
+
+DISCORD_BOT_TOKEN = _require("DISCORD_BOT_TOKEN")
+TRADIER_API_KEY = _require("TRADIER_API_KEY")
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
 
-SIGNALS_CHANNEL_ID = int(os.getenv("SIGNALS_CHANNEL_ID"))
-NEWS_CHANNEL_ID = int(os.getenv("NEWS_CHANNEL_ID"))
+SIGNALS_CHANNEL_ID = int(_require("SIGNALS_CHANNEL_ID"))
+NEWS_CHANNEL_ID = int(os.getenv("NEWS_CHANNEL_ID") or 0)
 
-WATCHLIST = os.getenv("WATCHLIST", "").split(",")
+WATCHLIST = [s.strip().upper() for s in os.getenv("WATCHLIST", "").split(",") if s.strip()]
 
 HEADERS = {
     "Authorization": f"Bearer {TRADIER_API_KEY}",

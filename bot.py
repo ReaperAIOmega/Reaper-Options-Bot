@@ -7,8 +7,16 @@ from signals import generate_signals_for_symbol
 from market import get_index_bias
 
 intents = discord.Intents.default()
-intents.message_content = True
-client = discord.Client(intents=intents)
+
+
+class SignalClient(discord.Client):
+    async def setup_hook(self):
+        # discord.py 2.x: the event loop only exists after login, so background
+        # tasks must be started here rather than via client.loop before run().
+        self.loop.create_task(check_and_send_signals())
+
+
+client = SignalClient(intents=intents)
 
 EST = pytz.timezone("US/Eastern")
 
@@ -48,53 +56,66 @@ async def check_and_send_signals():
     channel = client.get_channel(SIGNALS_CHANNEL_ID)
 
     sent_alerts = {
+        "day": None,
         "first_alert": False,
         "signals_sent": 0,
+        "bias_warned": False,
     }
 
     while not client.is_closed():
-        now = datetime.now(EST)
-        bias = get_index_bias()
-        if bias == "bearish":
-            # Send caution message once per day only
-            if not sent_alerts.get("bias_warned", False):
-                await channel.send(
-                    "@everyone ⚠️ Market shows bearish bias. Trade signals may be less reliable."
-                )
-                sent_alerts["bias_warned"] = True
-        else:
-            sent_alerts["bias_warned"] = False
-
-        max_signals = MAX_SIGNALS["subsequent_alerts"]
-        if not sent_alerts["first_alert"]:
-            # At 9 AM EST max 6 signals
-            if now.time().hour == 9 and now.time().minute <= 15:
-                max_signals = MAX_SIGNALS["first_alert"]
-
-        signals_all = []
-        for symbol in WATCHLIST:
-            signals = generate_signals_for_symbol(symbol)
-            if signals:
-                signals_all.extend(signals)
-
-        # Sort by score descending
-        signals_all.sort(key=lambda s: s["score"], reverse=True)
-
-        # Filter max signals
-        to_send = signals_all[:max_signals]
-
-        if to_send:
-            await send_signals(channel, to_send)
-            sent_alerts["first_alert"] = True
-            sent_alerts["signals_sent"] += len(to_send)
-
+        try:
+            await _run_cycle(channel, sent_alerts)
+        except Exception as exc:  # keep the loop alive on API/network errors
+            print(f"Signal cycle failed: {exc!r}")
         # Sleep until next target time (roughly every 15-30 min during market hours)
         await asyncio.sleep(900)
+
+
+async def _run_cycle(channel, sent_alerts):
+    now = datetime.now(EST)
+    if now.weekday() >= 5 or not (time(9, 0) <= now.time() <= time(16, 0)):
+        return  # outside US regular session
+
+    # Reset per-day state
+    if sent_alerts["day"] != now.date():
+        sent_alerts.update(day=now.date(), first_alert=False, signals_sent=0, bias_warned=False)
+
+    # requests is blocking; run off the event loop so the gateway heartbeat isn't starved
+    bias = await asyncio.to_thread(get_index_bias)
+    if bias == "bearish" and not sent_alerts["bias_warned"]:
+        # Send caution message once per day only
+        await channel.send(
+            "@everyone ⚠️ Market shows bearish bias. Trade signals may be less reliable."
+        )
+        sent_alerts["bias_warned"] = True
+
+    max_signals = MAX_SIGNALS["subsequent_alerts"]
+    if not sent_alerts["first_alert"]:
+        # At 9 AM EST max 6 signals
+        if now.time().hour == 9 and now.time().minute <= 15:
+            max_signals = MAX_SIGNALS["first_alert"]
+
+    signals_all = []
+    for symbol in WATCHLIST:
+        signals = await asyncio.to_thread(generate_signals_for_symbol, symbol)
+        if signals:
+            signals_all.extend(signals)
+
+    # Sort by score descending
+    signals_all.sort(key=lambda s: s["score"], reverse=True)
+
+    # Filter max signals
+    to_send = signals_all[:max_signals]
+
+    if to_send:
+        await send_signals(channel, to_send)
+        sent_alerts["first_alert"] = True
+        sent_alerts["signals_sent"] += len(to_send)
+
+
 
 @client.event
 async def on_ready():
     print(f"Logged in as {client.user}")
-
-client.loop.create_task(check_and_send_signals())
 
 client.run(DISCORD_BOT_TOKEN)

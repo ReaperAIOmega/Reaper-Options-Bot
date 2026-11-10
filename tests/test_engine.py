@@ -43,6 +43,7 @@ def test_entry_window_is_enforced_before_any_market_data_call():
         out = run_cycle(client, cfg(), CycleState(), NOW.replace(hour=t[0], minute=t[1]))
         assert out == {"messages": [], "skipped": {}, "market": "outside_entry_window"} and client.calls == []
     assert sig(FakeClient(), NOW.replace(hour=14, minute=59))[1] != ["outside_entry_window"]
+    assert sig(FakeClient(), NOW.replace(hour=9, minute=45))[1] != ["outside_entry_window"]
 
 
 def test_symbols_outside_policy_are_refused():

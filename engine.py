@@ -47,9 +47,13 @@ def index_bias(client) -> str:
 def load_sessions(client, now: datetime) -> dict:
     local = now.astimezone(ET)
     days = []
-    for back in (40, 0):  # current and previous month cover the 30-day time-sales window
-        ref = (local - timedelta(days=back)).date()
+    # A 30-day window can cross three calendar months (for example March 2).
+    # Visit each intersecting month; sampling a fixed offset can skip February.
+    ref = (local - timedelta(days=30)).date().replace(day=1)
+    last_month = local.date().replace(day=1)
+    while ref <= last_month:
         days += client.calendar(ref.year, ref.month)
+        ref = (ref.replace(day=28) + timedelta(days=4)).replace(day=1)
     return sessions_from_calendar(days)
 
 

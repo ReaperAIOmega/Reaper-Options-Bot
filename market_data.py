@@ -71,8 +71,9 @@ def aggregate_intraday(rows: list[dict], minutes: int, sessions: dict[date, Sess
         items.sort(key=lambda item: item[0])
         expected = int((bar_end - bar_start).total_seconds() // (BASE_MINUTES * 60))
         starts = [s for s, _ in items]
-        if len(set(starts)) != expected or starts[0] != bar_start:
-            continue  # data gap: never fabricate a bar
+        expected_starts = [bar_start + timedelta(minutes=BASE_MINUTES * i) for i in range(expected)]
+        if starts != expected_starts:
+            continue  # Reject gaps, duplicates and off-grid rows; never guess which row is authoritative.
         rows_ = [r for _, r in items]
         bars.append({
             "start": bar_start, "end": bar_end,

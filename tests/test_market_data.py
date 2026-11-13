@@ -73,3 +73,16 @@ def test_freshness():
     assert is_fresh(bars, 15, at(2026, 3, 10, 11, 0))
     assert not is_fresh(bars, 15, at(2026, 3, 10, 11, 30))
     assert not is_fresh([], 15, at(2026, 3, 10, 11, 0))
+
+
+def test_duplicate_rows_are_rejected_instead_of_inflating_volume():
+    s = sessions((2026, 3))
+    rows = full_day(date(2026, 3, 10))[:16]
+    assert aggregate_intraday(rows + [dict(rows[0])], 240, s, at(2026, 3, 10, 13, 30)) == []
+
+
+def test_off_grid_row_cannot_replace_missing_quarter_hour():
+    s = sessions((2026, 3))
+    rows = full_day(date(2026, 3, 10))[:16]
+    rows[1] = {**rows[1], "time": "2026-03-10T09:46:00"}
+    assert aggregate_intraday(rows, 240, s, at(2026, 3, 10, 13, 30)) == []

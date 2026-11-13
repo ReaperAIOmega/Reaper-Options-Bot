@@ -122,3 +122,22 @@ def test_discord_layer_imports_and_never_pings_by_default(monkeypatch):
     bot = importlib.import_module("bot")
     assert bot.ALLOWED_MENTIONS.everyone is False and bot.ALLOWED_MENTIONS.roles is False
     assert bot.check_channel_permissions(None) == ["signals channel not found or not visible to the bot"]
+
+
+def test_calendar_covers_every_month_intersecting_30_day_window():
+    from tests.fixtures import calendar_month
+    from datetime import date
+    class CalendarClient:
+        def __init__(self):
+            self.calls = []
+        def calendar(self, year, month):
+            self.calls.append((year, month))
+            return calendar_month(year, month)
+    for now, expected in [
+        (datetime(2026, 3, 2, 10, tzinfo=ET), [(2026, 1), (2026, 2), (2026, 3)]),
+        (datetime(2026, 1, 2, 10, tzinfo=ET), [(2025, 12), (2026, 1)]),
+        (datetime(2026, 11, 13, 10, tzinfo=ET), [(2026, 10), (2026, 11)]),
+    ]:
+        client = CalendarClient()
+        load_sessions(client, now)
+        assert client.calls == expected
